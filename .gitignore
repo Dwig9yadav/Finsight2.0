@@ -1,0 +1,4 @@
+node_modules/
+phonepe/phonepe.db
+*.db
+.DS_Store
