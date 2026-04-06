@@ -10,6 +10,7 @@
     "dev": "concurrently \"npm run dev -w phonepe\" \"npm run dev -w finsight\"",
     "dev:phonepe": "npm run dev -w phonepe",
     "dev:finsight": "npm run dev -w finsight",
+    "finsight": "npm run dev:finsight",
     "build": "npm run build -w phonepe && npm run build -w finsight"
   },
   "devDependencies": {

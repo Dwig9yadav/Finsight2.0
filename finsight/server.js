@@ -1,12 +1,16 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
+const marketplaceDbPath = path.join(__dirname, 'finsight.db');
 const port = Number(process.env.PORT || 3001);
 const envPath = path.join(__dirname, '.env');
+const rootEnvPath = path.join(__dirname, '..', '.env');
+const marketplaceDb = new DatabaseSync(marketplaceDbPath);
 let monthlyBudget = 1000000000;
 let lastSeenTransactionCount = 0;
 const geminiCache = {
@@ -16,26 +20,102 @@ const geminiCache = {
 };
 
 async function loadEnvFile() {
-  try {
-    const raw = await fs.readFile(envPath, 'utf8');
-    const lines = raw.split(/\r?\n/);
+  const files = [envPath, rootEnvPath];
+  for (const filePath of files) {
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      const lines = raw.split(/\r?\n/);
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
-        continue;
-      }
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+          continue;
+        }
 
-      const equalsIndex = trimmed.indexOf('=');
-      const key = trimmed.slice(0, equalsIndex).trim();
-      const value = trimmed.slice(equalsIndex + 1).trim().replace(/^['"]|['"]$/g, '');
-      if (key && process.env[key] === undefined) {
-        process.env[key] = value;
+        const equalsIndex = trimmed.indexOf('=');
+        const key = trimmed.slice(0, equalsIndex).trim();
+        const value = trimmed.slice(equalsIndex + 1).trim().replace(/^['"]|['"]$/g, '');
+        if (key && process.env[key] === undefined) {
+          process.env[key] = value;
+        }
       }
+    } catch {
+      // Optional env file.
     }
-  } catch {
-    // Optional local file.
   }
+}
+
+function initializeMarketplaceSchema() {
+  marketplaceDb.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS marketplace_listings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      brand TEXT NOT NULL,
+      originalValue REAL NOT NULL,
+      askingPrice REAL NOT NULL,
+      platformFee REAL NOT NULL,
+      sellerNote TEXT,
+      expiry TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      timestamp INTEGER NOT NULL
+    );
+  `);
+}
+
+function insertMarketplaceListing({ type, brand, originalValue, askingPrice, platformFee, sellerNote, expiry }) {
+  const result = marketplaceDb
+    .prepare(
+      'INSERT INTO marketplace_listings (type, brand, originalValue, askingPrice, platformFee, sellerNote, expiry, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    )
+    .run(type, brand, originalValue, askingPrice, platformFee, sellerNote, expiry, 'active', Date.now());
+
+  const row = marketplaceDb
+    .prepare(
+      'SELECT id, type, brand, originalValue, askingPrice, platformFee, sellerNote, expiry, status, timestamp FROM marketplace_listings WHERE id = ?'
+    )
+    .get(result.lastInsertRowid);
+
+  const snapshot = {
+    id: String(row.id),
+    type: String(row.type),
+    brand: String(row.brand),
+    originalValue: toRupeeNumber(Number(row.originalValue || 0)),
+    askingPrice: toRupeeNumber(Number(row.askingPrice || 0)),
+    platformFee: toRupeeNumber(Number(row.platformFee || 0)),
+    sellerNote: String(row.sellerNote || ''),
+    expiry: String(row.expiry || ''),
+    status: String(row.status || 'active'),
+    timestamp: Number(row.timestamp || Date.now())
+  };
+}
+
+function listActiveMarketplaceListings() {
+  const rows = marketplaceDb
+    .prepare(
+      'SELECT id, type, brand, originalValue, askingPrice, platformFee, sellerNote, expiry, status, timestamp FROM marketplace_listings WHERE status = ? ORDER BY timestamp DESC'
+    )
+    .all('active');
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    type: String(row.type),
+    brand: String(row.brand),
+    originalValue: toRupeeNumber(Number(row.originalValue || 0)),
+    askingPrice: toRupeeNumber(Number(row.askingPrice || 0)),
+    platformFee: toRupeeNumber(Number(row.platformFee || 0)),
+    sellerNote: String(row.sellerNote || ''),
+    expiry: String(row.expiry || ''),
+    status: String(row.status || 'active'),
+    timestamp: Number(row.timestamp || Date.now())
+  }));
+}
+
+function computePlatformFee(askingPrice) {
+  if (askingPrice <= 0) return 0;
+  if (askingPrice < 500) return toRupeeNumber(Math.min(10, Math.max(5, askingPrice * 0.02)));
+  if (askingPrice <= 2000) return toRupeeNumber(Math.min(25, Math.max(15, askingPrice * 0.015)));
+  return toRupeeNumber(askingPrice * 0.02);
 }
 
 const mimeTypes = new Map([
@@ -316,16 +396,16 @@ async function buildGeminiInsightsPayload(input) {
   const prompt = [
     'You are a friendly financial coach for Indian users. Your goal is to provide actionable, personalized, and encouraging advice. Return only JSON.',
     'The user lives in India, so use rupees (₹) and Indian finance context.',
-    'Your response must follow this exact JSON format: {"tips": ["string", ...], "future_alerts": [{"priority": "Low|Medium|High|Critical", "title": "string", "message": "string"}, ...], "warning": "string|null"}',
+    'Your response must follow this exact JSON format: {"tips": ["string", ...], "future_alerts": [{"priority": "Low|Medium|High|Critical", "title": "string", "message": "string"}, ...], "warning": "string|null", "need_want_insight": "string"}',
     '---',
     'USER\'S FINANCIAL SNAPSHOT:',
-    `Monthly total spent: ${toRupee(input.monthlySpent)}`,
-    `Spent today: ${toRupee(input.todaySpent)}`,
-    `Spending on Needs: ${toRupee(input.needsSpent)}`,
-    `Spending on Wants: ${toRupee(input.wantsSpent)}`,
-    `Budget remaining: ${toRupee(input.budgetLeft)}`,
+    `Monthly total spent: ₹${input.monthlySpent}`,
+    `Spent today: ₹${input.todaySpent}`,
+    `Spending on Needs: ₹${input.needsSpent}`,
+    `Spending on Wants: ₹${input.wantsSpent}`,
+    `Budget remaining: ₹${input.budgetLeft}`,
     `Current financial health score: ${input.healthScore}/100`,
-    `Predicted spend for next month: ${toRupee(input.forecast?.predicted || 0)}`,
+    `Predicted spend for next month: ₹${input.forecast?.predicted || 0}`,
     '---',
     'YOUR TASK:',
     '1.  **Tips**: Provide 4 short, practical, and encouraging tips. The tips should be directly related to the user\'s snapshot. For example, if "Wants" spending is high, suggest a specific way to manage it.',
@@ -354,7 +434,8 @@ async function buildGeminiInsightsPayload(input) {
             .filter((alert) => alert.title && alert.message)
             .slice(0, 4)
         : [],
-      warning: String(ai?.warning || '').trim() || null
+      warning: String(ai?.warning || '').trim() || null,
+      need_want_insight: String(ai?.need_want_insight || '').trim() || null
     };
 
     geminiCache.insights = { key: payloadKey, at: nowMs, data: normalized };
@@ -613,6 +694,26 @@ function buildFutureAlerts({ predictedNextMonth, monthlyBudgetLimit, averageDail
   return alerts.slice(0, 4);
 }
 
+function buildNeedWantInsight({ needsShare, wantsShare, needsSpent, wantsSpent, monthlySpent }) {
+  if (monthlySpent <= 0) {
+    return 'Start with a few tracked expenses so AI can generate Need vs Want insights.';
+  }
+
+  if (wantsShare >= 75) {
+    return `Wants are ${toRupeeNumber(wantsShare)}% of total spend. Pause one impulse category this week.`;
+  }
+
+  if (wantsShare >= 55) {
+    return `Wants are higher than needs (${toRupeeNumber(wantsSpent)} vs ${toRupeeNumber(needsSpent)}). Set a weekly wants cap.`;
+  }
+
+  if (needsShare >= 70) {
+    return `Needs are dominant at ${toRupeeNumber(needsShare)}%. Keep this discipline and avoid rebound spending.`;
+  }
+
+  return `Need vs Want split is balanced (${toRupeeNumber(needsShare)}% / ${toRupeeNumber(wantsShare)}%). Maintain this ratio.`;
+}
+
 function buildNextMonthForecast(entries, monthlySpent, now, monthlyBudgetLimit) {
   const last30Start = new Date(now);
   last30Start.setDate(now.getDate() - 29);
@@ -658,7 +759,7 @@ function buildNextMonthForecast(entries, monthlySpent, now, monthlyBudgetLimit) 
   );
   const suggestedBudget = toRupeeNumber(Math.max(monthlyBudgetLimit, predicted * 1.07));
 
-  return {
+  const snapshot = {
     days_in_next_month: daysInNextMonth,
     daily_run_rate: blendedDaily,
     predicted,
@@ -666,6 +767,8 @@ function buildNextMonthForecast(entries, monthlySpent, now, monthlyBudgetLimit) 
     confidence: dayValues.length >= 14 ? 'high' : dayValues.length >= 7 ? 'medium' : 'low',
     month_name: nextMonthStart.toLocaleDateString('en-IN', { month: 'long' })
   };
+
+  return snapshot;
 }
 
 function buildDailyExpenseReport(entries) {
@@ -840,7 +943,7 @@ async function buildAnalyticsSnapshot() {
     trackAndDeductCount
   });
 
-  return {
+  const snapshot = {
     source: {
       db_path: process.env.FINSIGHT_DB_PATH || 'shared-phonepe-state',
       connected: shared.ok,
@@ -897,6 +1000,13 @@ async function buildAnalyticsSnapshot() {
       health_score: health.score,
       needs_share: monthlySpent > 0 ? toRupeeNumber((needsSpent / monthlySpent) * 100) : 0,
       wants_share: wantsShare,
+      need_want_insight: buildNeedWantInsight({
+        needsShare: monthlySpent > 0 ? (needsSpent / monthlySpent) * 100 : 0,
+        wantsShare,
+        needsSpent,
+        wantsSpent,
+        monthlySpent
+      }),
       active_emi_count: 0,
       active_installments_remaining: 0,
       gemini_live: Boolean(process.env.GEMINI_API_KEY),
@@ -935,6 +1045,9 @@ async function buildAnalyticsSnapshot() {
     if (geminiInsights.warning) {
       snapshot.insights.warning = geminiInsights.warning;
     }
+    if (geminiInsights.need_want_insight) {
+      snapshot.insights.need_want_insight = geminiInsights.need_want_insight;
+    }
   }
 
   return snapshot;
@@ -971,6 +1084,7 @@ function buildTransactionsCsv(transactions) {
 }
 
 await loadEnvFile();
+initializeMarketplaceSchema();
 monthlyBudget = Number(process.env.FINSIGHT_BUDGET || 1000000000);
 
 const server = http.createServer(async (req, res) => {
@@ -1372,6 +1486,55 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (error) {
       sendJson(res, 400, { ok: false, error: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/marketplace/list') {
+    try {
+      const body = await readJsonBody(req);
+      const brand = String(body.brand || '').trim();
+      const originalValue = toRupeeNumber(Number(body.originalValue || 0));
+      const askingPrice = toRupeeNumber(Number(body.askingPrice || 0));
+      const type = String(body.type || 'gift-card').trim().toLowerCase() === 'coupon' ? 'coupon' : 'gift-card';
+      const sellerNote = String(body.sellerNote || body.note || '').trim();
+
+      if (!brand) {
+        sendJson(res, 400, { message: 'Brand is required' });
+        return;
+      }
+      if (!Number.isFinite(originalValue) || originalValue <= 0) {
+        sendJson(res, 400, { message: 'Original value must be greater than 0' });
+        return;
+      }
+      if (!Number.isFinite(askingPrice) || askingPrice <= 0) {
+        sendJson(res, 400, { message: 'Asking price must be greater than 0' });
+        return;
+      }
+
+      const listing = {
+        type,
+        brand,
+        originalValue,
+        askingPrice,
+        platformFee: computePlatformFee(askingPrice),
+        sellerNote,
+        expiry: String(body.expiry || '')
+      };
+      const saved = insertMarketplaceListing(listing);
+      sendJson(res, 201, { message: 'Listing created successfully', listing: saved });
+    } catch (error) {
+      sendJson(res, 400, { message: error.message });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/marketplace/listings') {
+    try {
+      const active = listActiveMarketplaceListings();
+      sendJson(res, 200, { listings: active });
+    } catch (error) {
+      sendJson(res, 400, { message: error.message });
     }
     return;
   }

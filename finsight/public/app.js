@@ -8,6 +8,15 @@ const state = {
   detailedReport: null
 };
 
+const apiBase = window.location.port === '3001'
+  ? ''
+  : `${window.location.protocol}//${window.location.hostname}:3001`;
+
+function apiUrl(path) {
+  if (!path.startsWith('/')) return path;
+  return `${apiBase}${path}`;
+}
+
 function formatRupee(value) {
   return `₹${new Intl.NumberFormat('en-IN', {
     minimumFractionDigits: 2,
@@ -41,15 +50,17 @@ async function fileToBase64(file) {
 }
 
 async function apiGet(url) {
-  const response = await fetch(url);
+  const response = await fetch(apiUrl(url));
   if (!response.ok) {
-    throw new Error(`Request failed: ${url}`);
+    const text = await response.text();
+    throw new Error(text || `Request failed: ${url}`);
   }
-  return response.json();
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
 }
 
 async function apiSend(url, method, body = {}) {
-  const response = await fetch(url, {
+  const response = await fetch(apiUrl(url), {
     method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
@@ -57,7 +68,7 @@ async function apiSend(url, method, body = {}) {
   if (!response.ok) {
     let message = `Request failed: ${url}`;
     try {
-      const payload = await response.json();
+      const payload = JSON.parse(await response.text());
       if (payload?.message || payload?.error) {
         message = payload.message || payload.error;
       }
@@ -66,7 +77,8 @@ async function apiSend(url, method, body = {}) {
     }
     throw new Error(message);
   }
-  return response.json();
+  const text = await response.text();
+  return text ? JSON.parse(text) : {};
 }
 
 function setActiveView(view) {
@@ -208,20 +220,43 @@ function renderInsights() {
   const health = document.querySelector('#insights-health');
   const needs = document.querySelector('#needs-share');
   const wants = document.querySelector('#wants-share');
+  const needsBar = document.querySelector('#needs-bar');
+  const wantsBar = document.querySelector('#wants-bar');
+  const impact = document.querySelector('#insights-impact');
+  const remark = document.querySelector('#need-want-remark');
 
   if (!state.insights) return;
 
-  insightList.innerHTML = (state.insights.tips || []).map((tip) => `<li>${tip}</li>`).join('') || '<li>No insights yet.</li>';
-  warningHost.innerHTML = state.insights.warning ? `<div class="warning-banner">${state.insights.warning}</div>` : '';
+  const needsShare = Math.round(state.insights.needs_share || 0);
+  const wantsShare = Math.round(state.insights.wants_share || 0);
+  const impactLabel = wantsShare >= 70 ? 'Risk-heavy' : wantsShare >= 45 ? 'Needs attention' : 'Balanced';
+
+  insightList.innerHTML = (state.insights.tips || []).map((tip, index) => `
+    <li class="tip-card">
+      <span class="tip-index">0${index + 1}</span>
+      <p>${tip}</p>
+    </li>
+  `).join('') || '<li class="tip-card"><p>No insights yet.</p></li>';
+
+  warningHost.innerHTML = state.insights.warning ? `<div class="warning-banner impact-banner">${state.insights.warning}</div>` : '';
   futureAlertsHost.innerHTML = (state.insights.future_alerts || []).map((alert) => `
     <div class="future-alert ${String(alert.priority || '').toLowerCase()}">
-      <p>${alert.title}</p>
+      <div class="future-alert-head">
+        <span class="pill">${alert.priority}</span>
+        <strong>${alert.title}</strong>
+      </div>
       <span>${alert.message}</span>
     </div>
   `).join('');
   health.textContent = `Health: ${state.insights.health_score || 0}`;
-  needs.textContent = `${Math.round(state.insights.needs_share || 0)}%`;
-  wants.textContent = `${Math.round(state.insights.wants_share || 0)}%`;
+  needs.textContent = `${needsShare}%`;
+  wants.textContent = `${wantsShare}%`;
+  if (needsBar) needsBar.style.width = `${needsShare}%`;
+  if (wantsBar) wantsBar.style.width = `${wantsShare}%`;
+  if (impact) impact.textContent = impactLabel;
+  if (remark) {
+    remark.textContent = state.insights.need_want_insight || 'AI will suggest a need-vs-want action after enough spending data.';
+  }
 }
 
 function renderReport() {
@@ -432,6 +467,186 @@ async function simulateBillScan() {
   await refreshDashboard();
 }
 
+async function handleReceiptUpload() {
+  const fileInput = document.querySelector('[data-section="track"] #receipt-file');
+  const file = fileInput?.files?.[0];
+  const resultDiv = document.querySelector('#receipt-parse-result');
+
+  if (!file) {
+    if (resultDiv) resultDiv.textContent = 'Please select a receipt image/PDF first.';
+    throw new Error('Choose a receipt image or PDF first');
+  }
+
+  if (resultDiv) resultDiv.textContent = 'Parsing receipt with Gemini...';
+  const fileBase64 = await fileToBase64(file);
+
+  const payload = await apiSend('/api/analytics/receipt-upload', 'POST', {
+    filename: file.name,
+    file_size: file.size,
+    mime_type: file.type || null,
+    file_base64: fileBase64,
+    merchant_hint: null
+  });
+
+  const merchantInput = document.querySelector('#receipt-merchant');
+  const amountInput = document.querySelector('#receipt-amount');
+  const categoryInput = document.querySelector('#receipt-category');
+  const gstInput = document.querySelector('#receipt-gst');
+  const form = document.querySelector('#receipt-form');
+
+  if (merchantInput) {
+    merchantInput.value = payload.merchant_name || '';
+    merchantInput.dataset.parsedFileKey = payload.parsed_file_key || '';
+  }
+  if (amountInput) amountInput.value = Math.round(payload.estimated_amount || 0);
+  if (categoryInput && payload.category) categoryInput.value = payload.category;
+  if (gstInput) gstInput.value = payload.gst_number || '';
+  if (form) form.style.display = '';
+  if (resultDiv) resultDiv.textContent = payload.message || 'Receipt parsed successfully.';
+}
+
+async function handleReceiptSave() {
+  const file = document.querySelector('[data-section="track"] #receipt-file')?.files?.[0] || null;
+  const merchantInput = document.querySelector('#receipt-merchant');
+  const amountInput = optionalNumberFromInput('#receipt-amount');
+  const category = document.querySelector('#receipt-category')?.value || null;
+  const gstNumber = document.querySelector('#receipt-gst')?.value || null;
+  const parsedFileKey = merchantInput?.dataset?.parsedFileKey || null;
+  const merchant = merchantInput?.value?.trim() || null;
+
+  if (!merchant || !Number.isFinite(amountInput) || amountInput <= 0) {
+    throw new Error('Fill merchant and amount before saving track entry');
+  }
+
+  const fileBase64 = file ? await fileToBase64(file) : null;
+  const payload = await apiSend('/api/analytics/receipt-upload-save', 'POST', {
+    filename: file?.name || null,
+    file_size: file?.size || 0,
+    mime_type: file?.type || null,
+    file_base64: fileBase64,
+    parsed_file_key: parsedFileKey,
+    merchant_hint: merchant,
+    amount: amountInput,
+    category,
+    gst_number: gstNumber,
+    gst_rate: 18,
+    amount_is_inclusive: true,
+    transaction_type: 'cash',
+    entry_action: 'track_only',
+    note: 'Tracked from receipt upload'
+  });
+
+  const resultDiv = document.querySelector('#receipt-parse-result');
+  if (resultDiv) resultDiv.textContent = `${payload.message} | Saved ${formatRupee(payload.total_saved)}`;
+  showResult(payload.message, 'success');
+  await refreshDashboard();
+}
+
+async function handleManualEntry() {
+  const merchant = String(document.querySelector('#manual-merchant')?.value || '').trim();
+  const amount = optionalNumberFromInput('#manual-amount');
+  const category = document.querySelector('#manual-category')?.value || 'Others';
+  const type = document.querySelector('#manual-type')?.value || 'cash';
+
+  if (!merchant || !Number.isFinite(amount) || amount <= 0) {
+    throw new Error('Enter valid manual entry details');
+  }
+
+  const payload = await apiSend('/api/analytics/receipt-upload-save', 'POST', {
+    filename: `manual-${Date.now()}`,
+    file_size: 0,
+    merchant_hint: merchant,
+    amount,
+    category,
+    gst_number: null,
+    gst_rate: 0,
+    amount_is_inclusive: true,
+    transaction_type: type,
+    entry_action: type === 'upi' ? 'track_and_deduct' : 'track_only',
+    note: 'Manual track entry'
+  });
+
+  const manualResult = document.querySelector('#manual-result');
+  if (manualResult) manualResult.textContent = `${payload.message} | ${formatRupee(payload.total_saved)}`;
+  showResult('Manual entry saved', 'success');
+  await refreshDashboard();
+}
+
+async function handleMarketplaceList() {
+  const type = document.querySelector('#marketplace-type')?.value || 'gift-card';
+  const brand = String(document.querySelector('#marketplace-brand')?.value || '').trim();
+  const originalValue = optionalNumberFromInput('#marketplace-original');
+  const askingPrice = optionalNumberFromInput('#marketplace-asking');
+  const expiry = document.querySelector('#marketplace-expiry')?.value || '';
+  const sellerNote = String(document.querySelector('#marketplace-note')?.value || '').trim();
+
+  if (!brand || !Number.isFinite(originalValue) || originalValue <= 0 || !Number.isFinite(askingPrice) || askingPrice <= 0) {
+    throw new Error('Fill brand, original value, and asking price correctly');
+  }
+
+  const payload = await apiSend('/api/marketplace/list', 'POST', {
+    type,
+    brand,
+    originalValue,
+    askingPrice,
+    expiry,
+    sellerNote
+  });
+
+  const messageHost = document.querySelector('#marketplace-sell-result');
+  if (messageHost) {
+    messageHost.textContent = `Listed ${payload.listing.brand} | Fee ${formatRupee(payload.listing.platformFee)} | Seller receives ${formatRupee(payload.listing.askingPrice - payload.listing.platformFee)}`;
+  }
+
+  document.querySelector('#marketplace-brand').value = '';
+  document.querySelector('#marketplace-original').value = '';
+  document.querySelector('#marketplace-asking').value = '';
+  document.querySelector('#marketplace-expiry').value = '';
+  document.querySelector('#marketplace-note').value = '';
+
+  await loadMarketplaceListings();
+}
+
+async function loadMarketplaceListings() {
+  const host = document.querySelector('#marketplace-listings');
+  if (!host) return;
+
+  host.innerHTML = '<p class="muted">Loading listings...</p>';
+  const payload = await apiGet('/api/marketplace/listings');
+  const query = String(document.querySelector('#marketplace-search')?.value || '').trim().toLowerCase();
+  const listings = (payload.listings || []).filter((item) => {
+    if (!query) return true;
+    const haystack = `${item.brand} ${item.type} ${item.sellerNote || ''}`.toLowerCase();
+    return haystack.includes(query);
+  });
+
+  if (!listings.length) {
+    host.innerHTML = '<p class="muted">No active listings yet.</p>';
+    return;
+  }
+
+  host.innerHTML = listings.map((item) => {
+    const sellerGet = Number(item.askingPrice || 0) - Number(item.platformFee || 0);
+    return `
+      <article class="mini card marketplace-card">
+        <div class="mini-header">
+          <strong>${item.brand}</strong>
+          <span class="pill">${item.type}</span>
+        </div>
+        <div class="mini-row">
+          <span>Original ${formatRupee(item.originalValue)}</span>
+          <strong class="price">${formatRupee(item.askingPrice)}</strong>
+        </div>
+        <p class="muted">Note: ${item.sellerNote || 'No note added.'}</p>
+        <div class="mini-row">
+          <span>Platform fee: ${formatRupee(item.platformFee)}</span>
+          <span>Seller gets: ${formatRupee(sellerGet)}</span>
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
 async function downloadReport() {
   const lines = (state.detailedReport?.days || []).slice(0, 10).flatMap((day) => {
     const dateLine = `\n${day.date} | Total ${day.total} | UPI ${day.upi_total} | Cash ${day.cash_total}`;
@@ -469,9 +684,11 @@ document.addEventListener('click', async (event) => {
   const navButton = event.target.closest('[data-view]');
   if (navButton) {
     setActiveView(navButton.dataset.view);
+    if (navButton.dataset.view === 'marketplace') {
+      setTimeout(() => loadMarketplaceListings(), 50);
+    }
     return;
   }
-
   try {
     if (event.target.closest('#refresh-dashboard')) {
       await refreshDashboard();
@@ -494,6 +711,36 @@ document.addEventListener('click', async (event) => {
       return;
     }
 
+    if (event.target.closest('#receipt-upload-btn')) {
+      await handleReceiptUpload();
+      return;
+    }
+
+    if (event.target.closest('#receipt-save-btn')) {
+      await handleReceiptSave();
+      return;
+    }
+
+    if (event.target.closest('#manual-save-btn')) {
+      await handleManualEntry();
+      return;
+    }
+
+    if (event.target.closest('#marketplace-list-btn')) {
+      await handleMarketplaceList();
+      return;
+    }
+
+    if (event.target.closest('#marketplace-refresh-btn')) {
+      await loadMarketplaceListings();
+      return;
+    }
+
+    if (event.target.closest('#marketplace-search')) {
+      await loadMarketplaceListings();
+      return;
+    }
+
     if (event.target.closest('#upload-bills')) {
       await uploadBillsFile();
       return;
@@ -511,6 +758,14 @@ document.addEventListener('click', async (event) => {
 
     if (event.target.closest('#download-csv')) {
       downloadCsv();
+      return;
+    }
+
+    if (event.target.closest('.poll-chip')) {
+      const button = event.target.closest('.poll-chip');
+      document.querySelectorAll('.poll-chip').forEach((chip) => chip.classList.remove('active'));
+      button.classList.add('active');
+      return;
     }
   } catch (error) {
     showResult(error.message, 'critical');
